@@ -44,7 +44,54 @@ from nerfstudio.utils.math import k_nearest_sklearn, random_quat_tensor
 from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
+import time
+import torch.nn.functional as F
+import numpy as np
+import torchvision
+import torchvision.transforms.functional as TF
 
+def sobel_filter(image):
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=image.device).unsqueeze(0).unsqueeze(0)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=image.device).unsqueeze(0).unsqueeze(0)
+
+    grad_x = F.conv2d(image.unsqueeze(0).unsqueeze(0), sobel_x, padding=1).squeeze()
+    grad_y = F.conv2d(image.unsqueeze(0).unsqueeze(0), sobel_y, padding=1).squeeze()
+
+    return grad_x, grad_y
+
+def differentiable_canny(image, low_thresh=0.1, high_thresh=0.2, sigma=1.0):
+    kernel_size = int(2 * (sigma * 3) + 1)
+    gaussian_kernel = torch.exp(-0.5 * (torch.arange(-kernel_size//2 + 1, kernel_size//2 + 1, device=image.device)**2) / (sigma**2))
+    gaussian_kernel /= gaussian_kernel.sum()
+    gaussian_kernel = gaussian_kernel.unsqueeze(0).unsqueeze(0)
+    blurred = F.conv2d(image.unsqueeze(0).unsqueeze(0), gaussian_kernel, padding=kernel_size//2).squeeze()
+
+    grad_x, grad_y = sobel_filter(blurred)
+    magnitude = torch.sqrt(grad_x**2 + grad_y**2)
+
+    edges = torch.sigmoid((magnitude - low_thresh) / (high_thresh - low_thresh))
+    return edges
+
+def compute_edge_aware_smoothness_loss(depth_map, rgb_image, beta=10.0):
+    gray_image = TF.rgb_to_grayscale(rgb_image).squeeze(0)
+    edges = differentiable_canny(gray_image)
+    edge_map = edges  # Already normalized to [0, 1] in differentiable_canny
+
+    sobel_x, sobel_y = sobel_filter(gray_image)
+    grad_x = sobel_x.abs()
+    grad_y = sobel_y.abs()
+
+    depth_grad_x = F.pad(depth_map[:, :-1] - depth_map[:, 1:], (0, 1), value=0)
+    depth_grad_y = F.pad(depth_map[:-1, :] - depth_map[1:, :], (0, 0, 1, 0), value=0)
+
+    combined_weight_x = torch.exp(-beta * (1 - edge_map) * grad_x)
+    combined_weight_y = torch.exp(-beta * (1 - edge_map) * grad_y)
+
+    smoothness_loss_x = (depth_grad_x * combined_weight_x).mean()
+    smoothness_loss_y = (depth_grad_y * combined_weight_y).mean()
+
+    total_loss = smoothness_loss_x + smoothness_loss_y
+    return total_loss
 
 def resize_image(image: torch.Tensor, d: int):
     """
@@ -126,6 +173,8 @@ class SplatfactoModelConfig(ModelConfig):
     "Size of the cube to initialize random gaussians within"
     ssim_lambda: float = 0.2
     """weight of ssim loss"""
+    eal_lambda: float = 0.4
+    """weight of edge aware loss"""
     stop_split_at: int = 15000
     """stop splitting at this step"""
     sh_degree: int = 3
@@ -657,8 +706,15 @@ class SplatfactoModel(Model):
             batch: ground truth batch corresponding to outputs
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
+        print(f"\n\n{outputs}\n")
+        time.sleep(0)
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
+        depth_img = outputs["depth"]
+
+        # compute_edge_aware_smoothness_loss 
+        # using canny and sobel
+        edge_aware_loss = compute_edge_aware_smoothness_loss(depth_img, pred_img)
 
         # Set masked part of both ground-truth and rendered image to black.
         # This is a little bit sketchy for the SSIM loss.
@@ -686,7 +742,7 @@ class SplatfactoModel(Model):
             scale_reg = torch.tensor(0.0).to(self.device)
 
         loss_dict = {
-            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss + self.config.eal_lambda * edge_aware_loss,
             "scale_reg": scale_reg,
         }
 
