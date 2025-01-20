@@ -5,7 +5,7 @@ import cv2
 import numpy as np 
 from random import randint
 from torch import nn
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from lpm.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 
 from LightGlue.lightglue import LightGlue, SuperPoint,DISK, SIFT
 
